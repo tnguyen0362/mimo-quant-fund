@@ -6,7 +6,9 @@
 # 3. Provides a confidence level (0-1)
 # 4. Explains its reasoning in plain English
 #
-# Uses OpenRouter API to access MiMo 2.5 (~$0.15/M input, $1.20/M output)
+# Uses OpenRouter API to access LLMs.
+# Free models available: Llama 3.3 70B, Qwen3 80B, Gemma 4 31B, etc.
+# Paid models: MiMo 2.5 (~$0.15/M input), GPT-4o, Claude, etc.
 # Falls back to a simple keyword scorer if API is unavailable.
 
 import os
@@ -59,13 +61,20 @@ class MiMoSentiment:
     
     def __init__(self, 
                  api_key: Optional[str] = None,
-                 model: str = "openrouter/xiaomi/mimo-v2.5",
+                 model: str = "meta-llama/llama-3.3-70b-instruct:free",
                  use_fallback: bool = True,
                  cache_dir: str = "data/cache/llm"):
         """
         Args:
             api_key: OpenRouter API key (or set OPENROUTER_API_KEY env var)
-            model: Model identifier (default: MiMo 2.5 via OpenRouter)
+            model: Model identifier. Free options:
+                   - "meta-llama/llama-3.3-70b-instruct:free" (default, 131K context)
+                   - "qwen/qwen3-next-80b-a3b-instruct:free" (262K context)
+                   - "google/gemma-4-31b-it:free" (262K, multimodal)
+                   - "openrouter/free" (auto-picks random free model)
+                   Paid options:
+                   - "openrouter/xiaomi/mimo-v2.5" (~$0.15/M tokens)
+                   - "openai/gpt-4o" (~$2.50/M tokens)
             use_fallback: Use keyword fallback if API unavailable
             cache_dir: Directory to cache LLM responses
         """
@@ -339,3 +348,36 @@ Only output the JSON, nothing else."""
                 }, f, indent=2)
         except Exception:
             pass
+
+
+# Free model shortcuts
+FREE_MODELS = {
+    "llama-70b": "meta-llama/llama-3.3-70b-instruct:free",
+    "qwen-80b": "qwen/qwen3-next-80b-a3b-instruct:free",
+    "gemma-31b": "google/gemma-4-31b-it:free",
+    "free-router": "openrouter/free",
+}
+
+PAID_MODELS = {
+    "mimo-2.5": "openrouter/xiaomi/mimo-v2.5",
+    "mimo-2.5-pro": "openrouter/xiaomi/mimo-v2.5-pro",
+    "gpt-4o": "openai/gpt-4o",
+    "claude-sonnet": "anthropic/claude-sonnet-4",
+}
+
+
+def list_models():
+    """Print available models."""
+    print("\nFree Models (no cost, rate-limited):")
+    print("-" * 60)
+    for name, model_id in FREE_MODELS.items():
+        print(f"  {name:15s} → {model_id}")
+    
+    print("\nPaid Models (pay-per-token):")
+    print("-" * 60)
+    for name, model_id in PAID_MODELS.items():
+        print(f"  {name:15s} → {model_id}")
+    
+    print("\nUsage:")
+    print('  python -c "from llm.sentiment import list_models; list_models()"')
+    print('  Or set model in MiMoSentiment(model="llama-70b")')
