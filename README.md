@@ -1,20 +1,33 @@
 # MiMo Quant Fund
 
-LLM-powered quantitative hedge fund. MiMo 2.5 is the brain, Python is the plumbing.
+LLM-powered quantitative hedge fund. AI council is the brain, Python is the plumbing.
 
 ## What It Does
 
 Three-factor stock selection system:
 1. **Momentum** (40%) — Jegadeesh-Titman 12-1 cross-sectional momentum
 2. **Value** (30%) — Fama-French book-to-market + earnings yield
-3. **LLM Sentiment** (30%) — MiMo 2.5 analyzes news headlines, scores sentiment
+3. **LLM Council** (30%) — 4 free models vote independently on sentiment
 
-The LLM reads news and earnings data, outputs a sentiment score (-1 to +1) with confidence. Combined with rule-based momentum and value factors, it selects the top 15 stocks, equal-weighted, rebalanced monthly.
+The council approach: multiple AI models analyze the same news, each votes independently, votes are confidence-weighted and aggregated. This reduces individual model bias and improves signal quality.
+
+## The Council
+
+4 free models on OpenRouter, each analyzing the same data:
+
+| Model | Params | Context | Role |
+|-------|--------|---------|------|
+| Llama 3.3 70B | 70B | 131K | Meta's flagship open model |
+| Qwen3 Next 80B | 80B | 262K | Alibaba's frontier model |
+| Gemma 4 31B | 31B | 262K | Google's efficient model |
+| GPT-OSS 120B | 120B | 131K | OpenAI's open model |
+
+**Cost: $0** — all models are free on OpenRouter.
 
 ## Backtest Results
 
-| Metric | 2-Factor (Mom+Val) | 3-Factor (+MiMo) |
-|--------|-------------------|-----------------|
+| Metric | 2-Factor (Mom+Val) | 3-Factor (+Council) |
+|--------|-------------------|---------------------|
 | Annual Return | 8.87% | **11.75%** |
 | Sharpe Ratio | 0.78 | **1.03** |
 | Sortino Ratio | 0.96 | **1.27** |
@@ -39,7 +52,7 @@ pip install -r requirements.txt
 # Run (2-factor, no API key needed)
 python run_quant_backtest.py
 
-# Run (3-factor with MiMo 2.5 sentiment)
+# Run (3-factor with LLM Council)
 set OPENROUTER_API_KEY=sk-or-your-key-here    # Windows
 # export OPENROUTER_API_KEY=sk-or-your-key    # Mac/Linux
 python run_llm_backtest.py
@@ -59,10 +72,13 @@ trading-system/
 │   ├── momentum.py              # 12-1 cross-sectional momentum
 │   ├── value.py                 # Fama-French value factor
 │   ├── combined.py              # 2-factor ranking (mom + value)
-│   ├── llm_factor.py            # MiMo 2.5 sentiment factor
-│   └── llm_combined.py          # 3-factor ranking (+ LLM)
+│   ├── llm_factor.py            # Single-model LLM sentiment
+│   ├── llm_combined.py          # 3-factor ranking (+ single LLM)
+│   ├── council_factor.py        # Multi-model council sentiment
+│   └── council_combined.py      # 3-factor ranking (+ council)
 ├── llm/
-│   └── sentiment.py             # MiMo 2.5 via OpenRouter API
+│   ├── sentiment.py             # Single-model LLM sentiment
+│   └── council.py               # 4-model LLM council
 ├── engine/
 │   ├── signals.py               # Signal generation
 │   ├── position_sizer.py        # Half-Kelly position sizing
@@ -76,23 +92,50 @@ trading-system/
 │   ├── technical.py             # SMA, RSI, MACD, Bollinger
 │   └── fundamental.py           # Fundamental scoring
 ├── run_quant_backtest.py        # 2-factor backtest entry point
-├── run_llm_backtest.py          # 3-factor (LLM) backtest entry point
+├── run_llm_backtest.py          # 3-factor (council) backtest entry point
 └── requirements.txt
 ```
 
 ## How It Works
 
 ```
-Daily Pipeline:
+Monthly Rebalance Pipeline:
 ─────────────────────────────────────────────────────
 1. Fetch price data for 50 S&P 500 stocks (yfinance)
 2. Fetch fundamentals (P/E, P/B from yfinance)
 3. Fetch news headlines (yfinance news)
-4. MiMo 2.5 scores sentiment for each stock
-5. Rank by: 0.4 × momentum + 0.3 × value + 0.3 × sentiment
+4. Council deliberation:
+   - Llama 3.3 70B → sentiment vote
+   - Qwen3 Next 80B → sentiment vote
+   - Gemma 4 31B → sentiment vote
+   - GPT-OSS 120B → sentiment vote
+   - Aggregate: confidence-weighted average
+5. Rank by: 0.4 × momentum + 0.3 × value + 0.3 × council
 6. Select top 15, equal-weight
 7. Risk check: drawdown, position size, volatility
 8. Execute trades via Robinhood MCP (future)
+```
+
+## Council Architecture
+
+```
+News Headlines for AAPL
+        │
+        ├──── Llama 3.3 70B ──── sentiment: +0.7, confidence: 0.8
+        │
+        ├──── Qwen3 Next 80B ── sentiment: +0.6, confidence: 0.7
+        │
+        ├──── Gemma 4 31B ───── sentiment: +0.8, confidence: 0.9
+        │
+        └──── GPT-OSS 120B ──── sentiment: +0.5, confidence: 0.6
+                                    │
+                                    ▼
+                        Council Aggregator
+                        (confidence-weighted)
+                                    │
+                                    ▼
+                        Final: sentiment=+0.65, confidence=0.75
+                        Agreement: 85% (models agree)
 ```
 
 ## Configuration
@@ -106,18 +149,19 @@ All parameters in `config/settings.py`, overridable via environment variables:
 | `TARGET_VOL` | 0.15 | Target portfolio volatility |
 | `MOMENTUM_WEIGHT` | 0.40 | Weight for momentum factor |
 | `VALUE_WEIGHT` | 0.30 | Weight for value factor |
-| `LLM_WEIGHT` | 0.30 | Weight for LLM sentiment |
+| `LLM_WEIGHT` | 0.30 | Weight for LLM council |
 | `COMMISSION_RATE` | 0.001 | Commission per trade (0.1%) |
 | `SLIPPAGE_RATE` | 0.001 | Slippage per trade (0.1%) |
 
 ## Cost
 
-Running the full LLM backtest costs ~$0.24 on OpenRouter (MiMo 2.5 at $0.15/M tokens).
+Running the full LLM backtest: **$0.00** — all council models are free on OpenRouter.
 
 ## Roadmap
 
 - [x] Rule-based quant engine (momentum + value)
-- [x] MiMo 2.5 sentiment analysis
+- [x] Single-model LLM sentiment (MiMo 2.5)
+- [x] **Multi-model LLM council (4 free models)**
 - [x] Three-factor combined ranking
 - [x] Portfolio backtest engine
 - [x] Risk monitoring + volatility targeting

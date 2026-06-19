@@ -2,9 +2,14 @@
 """
 LLM-Driven Quantitative Hedge Fund Backtest
 ============================================
-Three-Factor System: Momentum + Value + MiMo 2.5 Sentiment
+Three-Factor System: Momentum + Value + LLM Council
 
-The LLM (MiMo 2.5) analyzes news and earnings to generate sentiment signals.
+4 free models vote independently on sentiment:
+- Llama 3.3 70B
+- Qwen3 Next 80B
+- Gemma 4 31B
+- GPT-OSS 120B
+
 Combined with rule-based momentum and value factors.
 Code handles data, risk management, and execution.
 
@@ -31,7 +36,7 @@ from datetime import datetime, timedelta
 from data.universe import UniverseManager
 from data.market import MarketData
 from data.fundamentals import FundamentalData
-from factors.llm_combined import LLMCombinedRanking
+from factors.council_combined import CouncilCombinedRanking
 from factors.combined import CombinedRanking  # Fallback (no LLM)
 from backtest.portfolio_engine import PortfolioBacktestEngine
 from engine.volatility_targeting import VolatilityTargeting
@@ -238,30 +243,30 @@ def run_llm_backtest():
     # ------------------------------------------------------------------ #
     # Step 5: Initialize Three-Factor Ranking
     # ------------------------------------------------------------------ #
-    print("\n[5/8] Initializing three-factor ranking engine...")
+    print("\n[5/8] Initializing three-factor ranking engine with LLM Council...")
     
-    # Try LLM version first, fall back to 2-factor if needed
+    # Try LLM council version first, fall back to 2-factor if needed
     use_llm = False
     try:
-        three_factor = LLMCombinedRanking(
+        three_factor = CouncilCombinedRanking(
             momentum_weight=0.40,
             value_weight=0.30,
-            llm_weight=0.30,
+            council_weight=0.30,
             top_n=TOP_N_STOCKS,
             api_key=api_key if api_key else None,
         )
         
-        # Test a single analysis to verify it works
-        test_result = three_factor.llm_factor.llm.analyze_stock(
+        # Test a single analysis to verify council works
+        test_result = three_factor.council.deliberate(
             "AAPL", ["Apple reports record quarterly revenue"]
         )
-        print(f"  LLM engine initialized (test: sentiment={test_result.sentiment:.2f}, source={test_result.source})")
+        print(f"  LLM Council initialized (test: sentiment={test_result.sentiment:.2f}, votes={test_result.num_votes})")
         
         use_llm = True
         
     except Exception as e:
-        logger.warning("LLM engine init failed: %s", e)
-        print(f"  [WARN] LLM engine failed: {e}")
+        logger.warning("LLM Council init failed: %s", e)
+        print(f"  [WARN] LLM Council failed: {e}")
         print(f"  Falling back to 2-factor (momentum + value)")
         three_factor = CombinedRanking(momentum_weight=0.5, value_weight=0.5, top_n=TOP_N_STOCKS)
         use_llm = False
@@ -418,13 +423,13 @@ def run_llm_backtest():
     # Summary
     # ------------------------------------------------------------------ #
     print(f"\n{'=' * 70}")
-    print(f"LLM-DRIVEN QUANT FUND -- COMPLETE")
+    print(f"LLM COUNCIL QUANT FUND -- COMPLETE")
     print(f"{'=' * 70}")
     print(f"\n  Annual Return:  {metrics['annual_return']:.2%}")
     print(f"  Sharpe Ratio:   {metrics['sharpe_ratio']:.2f}")
     print(f"  Max Drawdown:   {metrics['max_drawdown']:.2%}")
-    print(f"  LLM Sentiment:  {'Active (MiMo 2.5)' if use_llm else 'Fallback (keywords)'}")
-    print(f"  Factor Blend:   40% Momentum + 30% Value + 30% LLM Sentiment")
+    print(f"  LLM Sentiment:  {'Active (4-model council)' if use_llm else 'Fallback (keywords)'}")
+    print(f"  Factor Blend:   40% Momentum + 30% Value + 30% Council")
 
     # Compare to first ticker as a rough benchmark proxy
     benchmark_ticker = prices.columns[0]
