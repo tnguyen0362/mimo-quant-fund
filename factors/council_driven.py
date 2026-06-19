@@ -16,6 +16,7 @@ This makes the LLM the decision maker, not a passenger.
 import os
 import json
 import time
+import logging
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -23,9 +24,11 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from llm.council import LLMCouncil, CouncilResult
+from llm.council import LLMCouncil, CouncilResult, CouncilVote
 from factors.momentum import MomentumFactor
 from factors.value import ValueFactor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -240,27 +243,46 @@ class CouncilStockPicker:
     def _council_deliberate(self, candidates: list[str],
                             financial_context: dict) -> list[StockPick]:
         """
-        Council analyzes each candidate with real financial data.
-        Each model votes BUY / HOLD / SELL.
+        Council analyzes ALL candidates in ONE API call per model.
+        Uses the batch prompt from council.deliberate_all_at_once().
         """
-        picks = []
+        # Filter out insufficient data
+        valid_tickers = [t for t in candidates 
+                         if not financial_context.get(t, {}).get("insufficient_data")]
         
-        for ticker in candidates:
-            ctx = financial_context.get(ticker, {})
-            
-            if ctx.get("insufficient_data"):
-                continue
-            
-            # Build prompt with REAL data
-            prompt = self._build_picker_prompt(ctx)
-            
-            # Get council votes
-            # We override the deliberation to use our custom prompt
-            result = self._query_council(ticker, prompt)
-            
-            # Convert to StockPick
-            pick = self._result_to_pick(ticker, result, ctx)
-            picks.append(pick)
+        if not valid_tickers:
+            return []
+        
+        # Build news_data and financials_data for batch call
+        # The batch method expects: news_data = {ticker: [headlines...]}
+        # and financials_data = {ticker: {pe_ratio, market_cap, ...}}
+        # But our financial_context has richer data (returns, volatility, etc.)
+        # So we'll use a different approach: build the batch prompt ourselves
+        # using the picker's custom format, then send it via council's model querying
+        
+        # Build the batch prompt with ALL stocks
+        batch_prompt = self._build_batch_picker_prompt(valid_tickers, financial_context)
+        
+        # Send to council models (ONE call per model)
+        # Use council's internal model querying with our custom prompt
+        votes_per_model = []
+        for model_key, model_config in list(self.council.models.items())[:self.council.max_models_per_stock]:
+            vote = self.council._do_query_batch(model_key, model_config, batch_prompt)
+            if vote:
+                votes_per_model.append(vote)
+        
+        # Parse batch response — each model returns a JSON array
+        # We need to extract per-ticker results from each model's response
+        ticker_results = self._parse_batch_results(valid_tickers, votes_per_model, financial_context)
+        
+        # Convert to StockPick objects
+        picks = []
+        for ticker in valid_tickers:
+            if ticker in ticker_results:
+                result = ticker_results[ticker]
+                ctx = financial_context.get(ticker, {})
+                pick = self._result_to_pick(ticker, result, ctx)
+                picks.append(pick)
         
         return picks
     
@@ -318,8 +340,144 @@ STEP 2 - DECIDE: Based on your analysis, pick ONE action:
 
 You MUST return a non-zero sentiment. Strong opinions should have high absolute sentiment values.
 
-JSON only:
-{{"action": "BUY"|"HOLD"|"SELL", "conviction": 0.1-1.0, "sentiment": -0.9 to 0.9 (NEVER 0.0), "confidence": 0.1-1.0, "reasoning": "1 sentence"}}"""
+        JSON only:
+        {{"action": "BUY"|"HOLD"|"SELL", "conviction": 0.1-1.0, "sentiment": -0.9 to 0.9 (NEVER 0.0), "confidence": 0.1-1.0, "reasoning": "1 sentence"}}"""
+    
+    def _build_batch_picker_prompt(self, tickers: list[str], 
+                                    financial_context: dict) -> str:
+        """Build a batch prompt for ALL stocks at once."""
+        stock_blocks = []
+        for ticker in tickers:
+            ctx = financial_context.get(ticker, {})
+            if ctx.get("insufficient_data"):
+                continue
+            
+            price = ctx.get("last_price", "N/A")
+            returns = ctx.get("returns", {})
+            vol = ctx.get("volatility_annual", "N/A")
+            pct_high = ctx.get("pct_from_52w_high", "N/A")
+            fins = ctx.get("fundamentals", {})
+            
+            fin_lines = []
+            if fins.get("pe_ratio"): fin_lines.append(f"P/E: {fins['pe_ratio']:.1f}")
+            if fins.get("pb_ratio"): fin_lines.append(f"P/B: {fins['pb_ratio']:.1f}")
+            if fins.get("dividend_yield"): fin_lines.append(f"Div Yield: {fins['dividend_yield']:.2%}")
+            if fins.get("market_cap"):
+                mc = fins["market_cap"]
+                if mc > 1e12: fin_lines.append(f"Mkt Cap: ${mc/1e12:.1f}T")
+                elif mc > 1e9: fin_lines.append(f"Mkt Cap: ${mc/1e9:.1f}B")
+            
+            fin_text = ", ".join(fin_lines) if fin_lines else "No fundamental data"
+            
+            block = f"""{ticker}:
+Price: ${price}, 1d: {returns.get('1d','N/A')}%, 5d: {returns.get('5d','N/A')}%, 1m: {returns.get('1m','N/A')}%, 3m: {returns.get('3m','N/A')}%, 6m: {returns.get('6m','N/A')}%, 12m: {returns.get('12m','N/A')}%
+Vol: {vol}%, From 52w High: {pct_high}%, {fin_text}"""
+            stock_blocks.append(block)
+        
+        stocks_text = "\n---\n".join(stock_blocks)
+        
+        return f"""You are a quantitative analyst analyzing {len(tickers)} stocks simultaneously.
+
+For EACH stock below, determine: action (BUY/HOLD/SELL), conviction (0.1-1.0), sentiment (-0.9 to 0.9, NEVER 0.0), confidence (0.1-1.0), and a 1-sentence reasoning.
+
+STOCKS:
+{stocks_text}
+
+Return a JSON array with EXACTLY one object per stock, in the SAME ORDER:
+[
+  {{"ticker": "TICKER1", "action": "BUY"|"HOLD"|"SELL", "conviction": 0.1-1.0, "sentiment": -0.9 to 0.9, "confidence": 0.1-1.0, "reasoning": "1 sentence"}},
+  ...
+]
+
+RULES:
+- BUY: strong momentum + reasonable valuation + manageable risk
+- HOLD: neutral or uncertain
+- SELL: weak momentum or expensive or excessive risk
+- Sentiment MUST be non-zero. Strong opinions = high absolute values.
+- Return ONLY the JSON array, no other text."""
+
+    def _parse_batch_results(self, tickers: list[str], 
+                             votes_per_model: list,
+                             financial_context: dict) -> dict:
+        """Parse batch results from multiple models into per-ticker CouncilResults."""
+        # Collect all model responses into per-ticker data
+        ticker_model_data = {t: [] for t in tickers}
+        
+        for vote in votes_per_model:
+            if not vote or vote.error:
+                continue
+            
+            # vote.raw_content contains the raw API response text for batch
+            content = vote.raw_content if hasattr(vote, 'raw_content') and vote.raw_content else vote.reasoning
+            
+            try:
+                import json
+                parsed = self.council._parse_response(content)
+                if isinstance(parsed, dict) and parsed.get("reasoning") == "Parse error":
+                    # _parse_response returned fallback, skip
+                    continue
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        t = item.get("ticker", "").upper()
+                        if t in ticker_model_data:
+                            ticker_model_data[t].append({
+                                "model_name": vote.model_name,
+                                "sentiment": float(item.get("sentiment", 0)),
+                                "confidence": float(item.get("confidence", 0)),
+                                "reasoning": item.get("reasoning", ""),
+                            })
+            except Exception as e:
+                logger.warning(f"Failed to parse batch response from {vote.model_name}: {e}")
+        
+        # Aggregate per ticker
+        results = {}
+        for ticker in tickers:
+            model_data = ticker_model_data.get(ticker, [])
+            if not model_data:
+                # No valid data for this ticker
+                results[ticker] = CouncilResult(
+                    ticker=ticker, sentiment=0.0, confidence=0.0,
+                    agreement=0.0, reasoning="No council data", votes=[], num_votes=0
+                )
+                continue
+            
+            # Confidence-weighted average
+            total_weight = 0.0
+            weighted_sentiment = 0.0
+            confidences = []
+            
+            for md in model_data:
+                model_weight = self.council.models.get(md["model_name"], {}).get("weight", 1.0)
+                weight = md["confidence"] * model_weight
+                weighted_sentiment += md["sentiment"] * weight
+                total_weight += weight
+                confidences.append(md["confidence"])
+            
+            avg_sentiment = weighted_sentiment / total_weight if total_weight > 0 else 0.0
+            avg_confidence = np.mean(confidences) if confidences else 0.0
+            
+            # Agreement
+            sentiments = [md["sentiment"] for md in model_data]
+            if len(sentiments) > 1:
+                agreement = max(0.0, 1.0 - np.std(sentiments))
+            else:
+                agreement = 1.0
+            
+            final_confidence = avg_confidence * (0.5 + 0.5 * agreement)
+            
+            reasoning = " | ".join([f"[{md['model_name']}] {md['reasoning']}" for md in model_data[:3]])
+            
+            results[ticker] = CouncilResult(
+                ticker=ticker,
+                sentiment=avg_sentiment,
+                confidence=final_confidence,
+                agreement=agreement,
+                reasoning=reasoning,
+                votes=[],
+                num_votes=len(model_data),
+            )
+        
+        return results
     
     def _query_council(self, ticker: str, prompt: str) -> CouncilResult:
         """Query council models with our custom prompt."""

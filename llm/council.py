@@ -117,6 +117,7 @@ class CouncilVote:
     reasoning: str
     latency_ms: float = 0.0
     error: str = ""
+    raw_content: str = ""  # Raw API response text (used for batch parsing)
 
 
 @dataclass
@@ -218,31 +219,168 @@ class LLMCouncil:
         """
         Batch deliberation for multiple stocks.
         
+        Sends ALL stocks in ONE prompt per model (2 models = 2 API calls total).
+        
         Returns:
             DataFrame with columns: ticker, sentiment, confidence, agreement, 
                                     reasoning, num_votes
         """
+        # Use the batch method: one prompt per model, all stocks at once
+        all_results = self.deliberate_all_at_once(tickers, news_data, financials_data)
+        
+        df = pd.DataFrame(all_results)
+        return df
+    
+    def deliberate_all_at_once(self, tickers: list[str],
+                               news_data: dict[str, list[str]],
+                               financials_data: Optional[dict] = None) -> list[dict]:
+        """
+        Send ALL stocks to each model in a SINGLE API call.
+        
+        Instead of N calls per model (one per stock), this makes 1 call per model
+        containing all stocks. With 2 models, that's 2 API calls total regardless
+        of how many stocks there are.
+        
+        Args:
+            tickers: List of stock tickers
+            news_data: Dict mapping ticker -> list of news headlines
+            financials_data: Dict mapping ticker -> financial data dict
+        
+        Returns:
+            List of dicts: [{"ticker", "sentiment", "confidence", "reasoning"}, ...]
+        """
+        if not tickers:
+            return []
+        
+        # Build ONE prompt containing all stocks
+        prompt = self._build_batch_prompt(tickers, news_data, financials_data)
+        
+        # Select models (same as single-stock: max_models_per_stock)
+        model_items = list(self.models.items())[:self.max_models_per_stock]
+        
+        # Collect raw responses from each model (sequential with delay to avoid 429s)
+        votes: list[CouncilVote] = []
+        
+        for i, (model_key, model_config) in enumerate(model_items):
+            if i > 0:
+                time.sleep(3)  # Rate limit: wait between model calls
+            vote = self._query_batch_model(model_key, model_config, prompt)
+            if vote and not vote.error and vote.raw_content:
+                votes.append(vote)
+        
+        # Parse each model's raw_content as a JSON array
+        ticker_results: dict[str, list[dict]] = {t: [] for t in tickers}
+        
+        for vote in votes:
+            content = vote.raw_content
+            try:
+                parsed = self._parse_response(content)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if not isinstance(item, dict):
+                            continue
+                        item_ticker = item.get("ticker", "").upper()
+                        if item_ticker in ticker_results:
+                            ticker_results[item_ticker].append({
+                                "model_name": vote.model_name,
+                                "sentiment": float(item.get("sentiment", 0)),
+                                "confidence": float(item.get("confidence", 0)),
+                                "reasoning": item.get("reasoning", ""),
+                            })
+            except Exception:
+                pass
+        
+        # Aggregate: for each ticker, average across models
         results = []
-        
         for ticker in tickers:
-            news = news_data.get(ticker, [])
-            fins = financials_data.get(ticker) if financials_data else None
-            
-            result = self.deliberate(ticker, news, fins)
-            
-            results.append({
-                "ticker": ticker,
-                "sentiment": result.sentiment,
-                "confidence": result.confidence,
-                "agreement": result.agreement,
-                "reasoning": result.reasoning,
-                "num_votes": result.num_votes,
-            })
-            
-            # Brief pause between stocks to respect rate limits
-            time.sleep(0.5)
+            model_votes = ticker_results.get(ticker, [])
+            if model_votes:
+                avg_sentiment = float(np.mean([v.get("sentiment", 0.0) for v in model_votes]))
+                avg_confidence = float(np.mean([v.get("confidence", 0.0) for v in model_votes]))
+                reasoning = next(
+                    (v.get("reasoning", "No reasoning") for v in model_votes 
+                     if v.get("reasoning")), 
+                    "No reasoning"
+                )
+                results.append({
+                    "ticker": ticker,
+                    "sentiment": avg_sentiment,
+                    "confidence": avg_confidence,
+                    "agreement": 1.0,  # Single prompt = implicit agreement
+                    "reasoning": reasoning,
+                    "num_votes": len(model_votes),
+                })
+            else:
+                results.append({
+                    "ticker": ticker,
+                    "sentiment": 0.0,
+                    "confidence": 0.0,
+                    "agreement": 0.0,
+                    "reasoning": "All models failed for this ticker",
+                    "num_votes": 0,
+                })
         
-        return pd.DataFrame(results)
+        return results
+    
+    def _query_batch_model(self, model_key: str,
+                           model_config: dict,
+                           prompt: str) -> Optional[CouncilVote]:
+        """Query a model with a batch prompt. Returns CouncilVote with raw_content."""
+        if not self.api_key or not HAS_HTTPX:
+            return None
+        
+        return self._do_query_batch(model_key, model_config, prompt)
+    
+    def _do_query_batch(self, model_key: str,
+                        model_config: dict,
+                        prompt: str) -> Optional[CouncilVote]:
+        """Execute a single batch API query. Returns CouncilVote with raw_content for parsing."""
+        start_time = time.time()
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://trading-system.local",
+            "X-Title": "MiMo Quant Fund Council",
+        }
+        
+        payload = {
+            "model": model_config["model_id"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 2000,
+        }
+        
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(self.api_url, json=payload, headers=headers)
+                response.raise_for_status()
+                
+                data = response.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                
+                latency_ms = (time.time() - start_time) * 1000
+                
+                return CouncilVote(
+                    model_name=model_key,
+                    model_id=model_config["model_id"],
+                    sentiment=0.0,   # Not meaningful for batch; parsed later
+                    confidence=0.0,  # Not meaningful for batch; parsed later
+                    reasoning="",
+                    latency_ms=latency_ms,
+                    raw_content=content,
+                )
+                
+        except Exception as e:
+            return CouncilVote(
+                model_name=model_key,
+                model_id=model_config["model_id"],
+                sentiment=0.0,
+                confidence=0.0,
+                reasoning=f"Error: {str(e)}",
+                error=str(e),
+                raw_content="",
+            )
     
     def _build_prompt(self, ticker: str, 
                       news_headlines: list[str],
@@ -283,7 +421,50 @@ Where:
 - confidence: How confident you are in this assessment (0.0 to 1.0)
 - reasoning: Brief explanation of your analysis
 
-Only output the JSON, nothing else."""
+        Only output the JSON, nothing else."""
+    
+    def _build_batch_prompt(self, tickers: list[str],
+                            news_data: dict[str, list[str]],
+                            financials_data: Optional[dict] = None) -> str:
+        """Build a single prompt containing ALL stocks for batch analysis."""
+        n = len(tickers)
+        stock_blocks = []
+        for ticker in tickers:
+            headlines = news_data.get(ticker, [])
+            news_text = "\n".join(f"  - {h}" for h in headlines[:10]) if headlines else "  No recent news available."
+            fins = financials_data.get(ticker) if financials_data else None
+            pe = fins.get("pe_ratio", "N/A") if fins else "N/A"
+            mcap = fins.get("market_cap", "N/A") if fins else "N/A"
+            sector = fins.get("sector", "N/A") if fins else "N/A"
+            stock_blocks.append(
+                f"{ticker}:\n"
+                f"News:\n{news_text}\n"
+                f"Financials: P/E={pe}, Market Cap={mcap}, Sector={sector}"
+            )
+
+        stocks_text = "\n---\n".join(stock_blocks)
+
+        return f"""You are a quantitative investment analyst. Analyze the following {n} stocks and rate each one.
+
+For each stock, you'll see recent news headlines and financial data.
+
+Rate each stock as:
+- sentiment: float from -1.0 (extremely bearish) to +1.0 (extremely bullish)
+- confidence: float from 0.0 to 1.0 (how confident you are)
+- reasoning: 1-2 sentence explanation
+
+Respond in EXACTLY this JSON format — an array with one object per stock:
+[
+  {{"ticker": "AAPL", "sentiment": 0.5, "confidence": 0.8, "reasoning": "Strong growth..."}},
+  {{"ticker": "MSFT", "sentiment": 0.3, "confidence": 0.7, "reasoning": "Stable..."}}
+]
+
+STOCKS TO ANALYZE:
+---
+{stocks_text}
+---
+
+IMPORTANT: Return ONLY the JSON array, no other text. Analyze each stock independently."""
     
     def _collect_votes(self, prompt: str, ticker: str = "") -> list[CouncilVote]:
         """Collect votes from council models in parallel (rate-limit aware)."""
@@ -341,7 +522,8 @@ Only output the JSON, nothing else."""
     
     def _do_query(self, model_key: str, 
                   model_config: dict, 
-                  prompt: str) -> Optional[CouncilVote]:
+                  prompt: str,
+                  max_tokens: int = 200) -> Optional[CouncilVote]:
         """Execute a single API query to a model."""
         start_time = time.time()
         
@@ -356,7 +538,7 @@ Only output the JSON, nothing else."""
             "model": model_config["model_id"],
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            "max_tokens": 200,
+            "max_tokens": max_tokens,
         }
         
         try:
@@ -391,18 +573,77 @@ Only output the JSON, nothing else."""
                 error=str(e),
             )
     
-    def _parse_response(self, content: str) -> dict:
-        """Parse LLM JSON response, handling markdown code blocks."""
+    def _parse_response(self, content: str) -> dict | list:
+        """Parse LLM JSON response, handling markdown code blocks, prose wrappers, and trailing commas.
+        
+        Returns:
+            dict for single-stock responses, list for batch responses.
+        """
+        import re
+        
+        if not content or not content.strip():
+            return {"sentiment": 0.0, "confidence": 0.0, "reasoning": "Empty response"}
+        
+        # Attempt 1: Direct parse
         try:
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
-            
-            return json.loads(content)
+            parsed = json.loads(content.strip())
+            if isinstance(parsed, (dict, list)):
+                return parsed
         except (json.JSONDecodeError, ValueError):
-            return {"sentiment": 0.0, "confidence": 0.0, "reasoning": "Parse error"}
+            pass
+        
+        # Attempt 2: Extract from markdown code blocks
+        if "```" in content:
+            parts = content.split("```")
+            for part in parts[1::2]:  # Odd-indexed parts are inside code blocks
+                candidate = part.strip()
+                if candidate.startswith("json"):
+                    candidate = candidate[4:].strip()
+                if not candidate:
+                    continue
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, (dict, list)):
+                        return parsed
+                except (json.JSONDecodeError, ValueError):
+                    # Try cleaning trailing commas in this block
+                    cleaned = re.sub(r',\s*([}\]])', r'\1', candidate)
+                    try:
+                        parsed = json.loads(cleaned)
+                        if isinstance(parsed, (dict, list)):
+                            return parsed
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+        
+        # Attempt 3: Find first JSON array or object in the text
+        for pattern in [r'\[[\s\S]*\]', r'\{[\s\S]*\}']:
+            match = re.search(pattern, content)
+            if match:
+                candidate = match.group(0)
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, (dict, list)):
+                        return parsed
+                except (json.JSONDecodeError, ValueError):
+                    # Try cleaning trailing commas
+                    cleaned = re.sub(r',\s*([}\]])', r'\1', candidate)
+                    try:
+                        parsed = json.loads(cleaned)
+                        if isinstance(parsed, (dict, list)):
+                            return parsed
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+        
+        # Attempt 4: Clean entire content for trailing commas and retry
+        cleaned = re.sub(r',\s*([}\]])', r'\1', content)
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+        
+        return {"sentiment": 0.0, "confidence": 0.0, "reasoning": "Parse error"}
     
     def _aggregate_votes(self, ticker: str, 
                          votes: list[CouncilVote]) -> CouncilResult:
