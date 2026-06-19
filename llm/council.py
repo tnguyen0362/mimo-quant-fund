@@ -28,27 +28,74 @@ except ImportError:
     HAS_HTTPX = False
 
 
-# Council configuration: which free models to use
+# Council configuration: best free models on OpenRouter (June 2026)
+# Rate limit: ~20 req/min, 200 req/day across all free models
+# We pick the largest/most capable models for sentiment analysis
+
 COUNCIL_MODELS = {
-    "llama-70b": {
-        "model_id": "meta-llama/llama-3.3-70b-instruct:free",
-        "name": "Llama 3.3 70B",
-        "weight": 1.0,  # Base weight
+    # --- TIER 1: Largest models (best quality) ---
+    "qwen-coder-480b": {
+        "model_id": "qwen/qwen3-coder:free",
+        "name": "Qwen3 Coder 480B",
+        "weight": 1.2,  # Largest model, slightly higher weight
     },
-    "qwen-80b": {
-        "model_id": "qwen/qwen3-next-80b-a3b-instruct:free",
-        "name": "Qwen3 Next 80B",
-        "weight": 1.0,
+    "nemotron-ultra-550b": {
+        "model_id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "name": "Nemotron 3 Ultra 550B",
+        "weight": 1.2,
     },
-    "gemma-31b": {
-        "model_id": "google/gemma-4-31b-it:free",
-        "name": "Gemma 4 31B",
+    "hermes-405b": {
+        "model_id": "nousresearch/hermes-3-llama-3.1-405b:free",
+        "name": "Hermes 3 Llama 405B",
+        "weight": 1.1,
+    },
+    # --- TIER 2: Strong mid-size models ---
+    "nemotron-super-120b": {
+        "model_id": "nvidia/nemotron-3-super-120b-a12b:free",
+        "name": "Nemotron 3 Super 120B",
         "weight": 1.0,
     },
     "gpt-oss-120b": {
         "model_id": "openai/gpt-oss-120b:free",
         "name": "GPT-OSS 120B",
-        "weight": 1.2,  # Slightly higher weight (larger model)
+        "weight": 1.0,
+    },
+    "llama-70b": {
+        "model_id": "meta-llama/llama-3.3-70b-instruct:free",
+        "name": "Llama 3.3 70B",
+        "weight": 1.0,
+    },
+    # --- TIER 3: Efficient models (fast, good for diversity) ---
+    "gemma-31b": {
+        "model_id": "google/gemma-4-31b-it:free",
+        "name": "Gemma 4 31B",
+        "weight": 0.9,
+    },
+    "gpt-oss-20b": {
+        "model_id": "openai/gpt-oss-20b:free",
+        "name": "GPT-OSS 20B",
+        "weight": 0.8,
+    },
+    "nemotron-nano-30b": {
+        "model_id": "nvidia/nemotron-3-nano-30b-a3b:free",
+        "name": "Nemotron 3 Nano 30B",
+        "weight": 0.8,
+    },
+    "nemotron-nano-9b": {
+        "model_id": "nvidia/nemotron-nano-9b-v2:free",
+        "name": "Nemotron Nano 9B",
+        "weight": 0.7,
+    },
+    "llama-3b": {
+        "model_id": "meta-llama/llama-3.2-3b-instruct:free",
+        "name": "Llama 3.2 3B",
+        "weight": 0.5,  # Small but fast, adds diversity
+    },
+    # --- AUTO-SELECT: Let OpenRouter pick the best free model ---
+    "auto-router": {
+        "model_id": "openrouter/free",
+        "name": "Free Models Router",
+        "weight": 1.0,  # Meta-model, weight = average
     },
 }
 
@@ -100,7 +147,8 @@ class LLMCouncil:
                  api_key: Optional[str] = None,
                  max_workers: int = 4,
                  timeout: float = 30.0,
-                 cache_dir: str = "data/cache/council"):
+                 cache_dir: str = "data/cache/council",
+                 max_models_per_stock: int = 6):
         """
         Args:
             models: Dict of model configs (default: COUNCIL_MODELS)
@@ -108,6 +156,7 @@ class LLMCouncil:
             max_workers: Max parallel API calls
             timeout: Request timeout in seconds
             cache_dir: Cache directory for responses
+            max_models_per_stock: Max models to query per stock (rate limit control)
         """
         self.models = models or COUNCIL_MODELS
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
@@ -115,6 +164,7 @@ class LLMCouncil:
         self.timeout = timeout
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_models_per_stock = max_models_per_stock
         
         self.api_url = "https://openrouter.ai/api/v1/chat/completions"
     
@@ -223,12 +273,17 @@ Where:
 Only output the JSON, nothing else."""
     
     def _collect_votes(self, prompt: str) -> list[CouncilVote]:
-        """Collect votes from all council models in parallel."""
+        """Collect votes from council models in parallel (rate-limit aware)."""
         votes = []
         
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        # Select models: use max_models_per_stock to stay within rate limits
+        # With 50 stocks × 6 models = 300 requests (close to 200/day limit)
+        # With 50 stocks × 4 models = 200 requests (right at limit)
+        model_items = list(self.models.items())[:self.max_models_per_stock]
+        
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(model_items))) as executor:
             futures = {}
-            for model_key, model_config in self.models.items():
+            for model_key, model_config in model_items:
                 future = executor.submit(
                     self._query_model, model_key, model_config, prompt
                 )
