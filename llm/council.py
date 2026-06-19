@@ -100,6 +100,13 @@ COUNCIL_MODELS = {
 }
 
 
+# Simplified retry prompt when models return sentiment=0.0
+_RETRY_PROMPT_TEMPLATE = (
+    "Is {ticker} stock likely to go UP or DOWN from here? "
+    'Return JSON: {{"sentiment": +0.5 or -0.5, "confidence": 0.5, "reasoning": "brief"}}'
+)
+
+
 @dataclass
 class CouncilVote:
     """A single model's vote on sentiment."""
@@ -148,7 +155,7 @@ class LLMCouncil:
                  max_workers: int = 4,
                  timeout: float = 30.0,
                  cache_dir: str = "data/cache/council",
-                 max_models_per_stock: int = 6):
+                 max_models_per_stock: int = 2):
         """
         Args:
             models: Dict of model configs (default: COUNCIL_MODELS)
@@ -195,7 +202,7 @@ class LLMCouncil:
         prompt = self._build_prompt(ticker, news_headlines, financials)
         
         # Collect votes from all models (parallel)
-        votes = self._collect_votes(prompt)
+        votes = self._collect_votes(prompt, ticker=ticker)
         
         # Aggregate votes
         result = self._aggregate_votes(ticker, votes)
@@ -278,20 +285,19 @@ Where:
 
 Only output the JSON, nothing else."""
     
-    def _collect_votes(self, prompt: str) -> list[CouncilVote]:
+    def _collect_votes(self, prompt: str, ticker: str = "") -> list[CouncilVote]:
         """Collect votes from council models in parallel (rate-limit aware)."""
         votes = []
         
         # Select models: use max_models_per_stock to stay within rate limits
-        # With 50 stocks × 6 models = 300 requests (close to 200/day limit)
-        # With 50 stocks × 4 models = 200 requests (right at limit)
+        # With 50 stocks × 2 models = 100 requests (well within 200/day limit)
         model_items = list(self.models.items())[:self.max_models_per_stock]
         
         with ThreadPoolExecutor(max_workers=min(self.max_workers, len(model_items))) as executor:
             futures = {}
             for model_key, model_config in model_items:
                 future = executor.submit(
-                    self._query_model, model_key, model_config, prompt
+                    self._query_model, model_key, model_config, prompt, ticker
                 )
                 futures[future] = model_key
             
@@ -315,11 +321,28 @@ Only output the JSON, nothing else."""
     
     def _query_model(self, model_key: str, 
                      model_config: dict, 
-                     prompt: str) -> Optional[CouncilVote]:
-        """Query a single model for its sentiment vote."""
+                     prompt: str,
+                     ticker: str = "") -> Optional[CouncilVote]:
+        """Query a single model for its sentiment vote. Retries once if sentiment=0.0."""
         if not self.api_key or not HAS_HTTPX:
             return None
         
+        vote = self._do_query(model_key, model_config, prompt)
+        
+        # Retry with simplified prompt if model returned sentiment=0.0
+        if vote and vote.sentiment == 0.0 and not vote.error and ticker:
+            retry_prompt = _RETRY_PROMPT_TEMPLATE.format(ticker=ticker)
+            retry_vote = self._do_query(model_key, model_config, retry_prompt)
+            if retry_vote and retry_vote.sentiment != 0.0 and not retry_vote.error:
+                retry_vote.reasoning = f"[retry] {retry_vote.reasoning}"
+                return retry_vote
+        
+        return vote
+    
+    def _do_query(self, model_key: str, 
+                  model_config: dict, 
+                  prompt: str) -> Optional[CouncilVote]:
+        """Execute a single API query to a model."""
         start_time = time.time()
         
         headers = {
@@ -504,7 +527,7 @@ def print_council_result(result: CouncilResult):
     print(f"  Votes Cast:       {result.num_votes}")
     print(f"\n  Individual Votes:")
     for vote in result.votes:
-        status = "✓" if vote.error == "" else "✗"
-        print(f"    {status} {vote.model_name:15s} | sentiment={vote.sentiment:+.3f} | conf={vote.confidence:.2f} | {vote.latency_ms:.0f}ms")
+        status = "OK" if vote.error == "" else "ERR"
+        print(f"    [{status}] {vote.model_name:15s} | sentiment={vote.sentiment:+.3f} | conf={vote.confidence:.2f} | {vote.latency_ms:.0f}ms")
     print(f"\n  Reasoning: {result.reasoning[:100]}...")
     print(f"{'='*60}")

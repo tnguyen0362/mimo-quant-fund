@@ -6,7 +6,7 @@
 import pandas as pd
 import numpy as np
 from typing import Optional
-from ..llm.council import LLMCouncil, CouncilResult
+from llm.council import LLMCouncil, CouncilResult
 
 
 class CouncilFactor:

@@ -8,7 +8,7 @@ import numpy as np
 from typing import Optional
 from .momentum import MomentumFactor
 from .value import ValueFactor
-from ..llm.council import LLMCouncil, print_council_result
+from llm.council import LLMCouncil, print_council_result
 
 
 class CouncilCombinedRanking:
@@ -36,7 +36,7 @@ class CouncilCombinedRanking:
         self.council_weight = council_weight
         self.top_n = top_n
         
-        self.momentum = MomentumFactor(lookback=252, skip=21)
+        self.momentum = MomentumFactor(lookback_days=252, skip_days=21)
         self.value = ValueFactor()
         self.council = LLMCouncil(api_key=api_key)
     
@@ -57,8 +57,10 @@ class CouncilCombinedRanking:
         """
         tickers = prices.columns.tolist()
         
-        # Factor 1: Momentum
+        # Factor 1: Momentum (last row only = current cross-section)
         mom_rank = self.momentum.rank_stocks(prices)
+        if isinstance(mom_rank, pd.DataFrame):
+            mom_rank = mom_rank.iloc[-1]  # Last date's rankings
         mom_score = 1.0 - (mom_rank - 1) / max(len(tickers) - 1, 1)
         
         # Factor 2: Value
@@ -100,6 +102,10 @@ class CouncilCombinedRanking:
             self.value_weight * val_score +
             self.council_weight * council_score
         )
+        
+        # Ensure it's a Series (not DataFrame from index mismatch)
+        if isinstance(combined, pd.DataFrame):
+            combined = combined.squeeze()
         
         combined = combined.sort_values(ascending=False)
         
