@@ -28,74 +28,74 @@ except ImportError:
     HAS_HTTPX = False
 
 
-# Council configuration: best free models on OpenRouter (June 2026)
-# Rate limit: ~20 req/min, 200 req/day across all free models
-# We pick the largest/most capable models for sentiment analysis
+# Council configuration: REASONING models on OpenRouter (verified June 2026)
+# Strategy: Reasoning models think through sentiment step-by-step before deciding
+# This produces more reliable, explainable sentiment scores than standard models
 
 COUNCIL_MODELS = {
-    # --- TIER 1: Largest models (best quality) ---
-    "qwen-coder-480b": {
-        "model_id": "qwen/qwen3-coder:free",
-        "name": "Qwen3 Coder 480B",
-        "weight": 1.2,  # Largest model, slightly higher weight
-    },
-    "nemotron-ultra-550b": {
-        "model_id": "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "name": "Nemotron 3 Ultra 550B",
-        "weight": 1.2,
-    },
-    "hermes-405b": {
-        "model_id": "nousresearch/hermes-3-llama-3.1-405b:free",
-        "name": "Hermes 3 Llama 405B",
-        "weight": 1.1,
-    },
-    # --- TIER 2: Strong mid-size models ---
-    "nemotron-super-120b": {
-        "model_id": "nvidia/nemotron-3-super-120b-a12b:free",
-        "name": "Nemotron 3 Super 120B",
-        "weight": 1.0,
-    },
+    # --- TIER 1: Mandatory reasoning (always show chain-of-thought) ---
     "gpt-oss-120b": {
         "model_id": "openai/gpt-oss-120b:free",
         "name": "GPT-OSS 120B",
-        "weight": 1.0,
-    },
-    "llama-70b": {
-        "model_id": "meta-llama/llama-3.3-70b-instruct:free",
-        "name": "Llama 3.3 70B",
-        "weight": 1.0,
-    },
-    # --- TIER 3: Efficient models (fast, good for diversity) ---
-    "gemma-31b": {
-        "model_id": "google/gemma-4-31b-it:free",
-        "name": "Gemma 4 31B",
-        "weight": 0.9,
+        "weight": 1.2,  # Large reasoning model, higher weight
+        "reasoning": True,
     },
     "gpt-oss-20b": {
         "model_id": "openai/gpt-oss-20b:free",
         "name": "GPT-OSS 20B",
-        "weight": 0.8,
+        "weight": 1.0,
+        "reasoning": True,
+    },
+    # --- TIER 2: Optional reasoning (toggle chain-of-thought) ---
+    "nemotron-ultra-550b": {
+        "model_id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "name": "Nemotron 3 Ultra 550B",
+        "weight": 1.2,  # Largest model, highest weight
+        "reasoning": True,
+    },
+    "nemotron-super-120b": {
+        "model_id": "nvidia/nemotron-3-super-120b-a12b:free",
+        "name": "Nemotron 3 Super 120B",
+        "weight": 1.0,
+        "reasoning": True,
     },
     "nemotron-nano-30b": {
         "model_id": "nvidia/nemotron-3-nano-30b-a3b:free",
         "name": "Nemotron 3 Nano 30B",
-        "weight": 0.8,
+        "weight": 0.9,
+        "reasoning": True,
     },
     "nemotron-nano-9b": {
         "model_id": "nvidia/nemotron-nano-9b-v2:free",
         "name": "Nemotron Nano 9B",
         "weight": 0.7,
+        "reasoning": True,
     },
-    "llama-3b": {
-        "model_id": "meta-llama/llama-3.2-3b-instruct:free",
-        "name": "Llama 3.2 3B",
-        "weight": 0.5,  # Small but fast, adds diversity
+    # --- TIER 3: Strong general models (diversity) ---
+    "hermes-405b": {
+        "model_id": "nousresearch/hermes-3-llama-3.1-405b:free",
+        "name": "Hermes 3 Llama 405B",
+        "weight": 1.1,
+        "reasoning": False,
+    },
+    "llama-70b": {
+        "model_id": "meta-llama/llama-3.3-70b-instruct:free",
+        "name": "Llama 3.3 70B",
+        "weight": 1.0,
+        "reasoning": False,
+    },
+    "gemma-31b": {
+        "model_id": "google/gemma-4-31b-it:free",
+        "name": "Gemma 4 31B",
+        "weight": 0.9,
+        "reasoning": False,
     },
     # --- AUTO-SELECT: Let OpenRouter pick the best free model ---
     "auto-router": {
         "model_id": "openrouter/free",
         "name": "Free Models Router",
-        "weight": 1.0,  # Meta-model, weight = average
+        "weight": 1.0,
+        "reasoning": False,
     },
 }
 
@@ -252,23 +252,29 @@ Financial Data:
 - Sector: {financials.get('sector', 'N/A')}
 """
         
-        return f"""You are a quantitative investment analyst. Analyze the sentiment for {ticker} stock.
+        return f"""You are a quantitative investment analyst. Think step-by-step about the sentiment for {ticker} stock.
 
 Recent News:
 {news_text}
 {financials_text}
 
+Analyze this information:
+1. What are the key themes in these headlines?
+2. What do they suggest about the company's near-term outlook?
+3. Are there any risks or concerns mentioned?
+4. Overall, is this bullish, bearish, or neutral?
+
 Respond in EXACTLY this JSON format (no other text):
 {{
     "sentiment": <float from -1.0 to 1.0>,
     "confidence": <float from 0.0 to 1.0>,
-    "reasoning": "<1-2 sentence explanation>"
+    "reasoning": "<1-2 sentence explanation of your analysis>"
 }}
 
 Where:
 - sentiment: -1.0 = extremely bearish, 0.0 = neutral, 1.0 = extremely bullish
 - confidence: How confident you are in this assessment (0.0 to 1.0)
-- reasoning: Brief explanation of your assessment
+- reasoning: Brief explanation of your analysis
 
 Only output the JSON, nothing else."""
     
